@@ -103,7 +103,7 @@
 		};
 
 		firmwarekms: firmwarekms@7d503000 {
-			compatible = "raspberrypi,rpi-firmware-kms";
+			compatible = "raspberrypi,rpi-firmware-kms-2712";
 			/* SUN_L2 interrupt reg */
 			reg = <0x7d503000 0x18>;
 			interrupt-parent = <&cpu_l2_irq>;
@@ -1086,7 +1086,6 @@
 				      0x00 0x00000000
 				      0x10 0x00000000>;
 
-			brcm,enable-mps-rcb;
 			brcm,enable-l1ss;
 			status = "disabled";
 		};
@@ -1158,6 +1157,7 @@
 			clocks = <&firmware_clocks 11>;
 			clock-names = "hevc";
 			status = "disabled";
+			iommus = <&iommu2>;
 		};
 
 		sdio1: mmc@fff000 {

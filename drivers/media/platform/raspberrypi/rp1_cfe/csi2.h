@@ -17,11 +17,13 @@
 
 #define CSI2_NUM_CHANNELS 4
 
+#define DISCARDS_TABLE_NUM_VCS 4
+
 enum csi2_mode {
-	CSI2_MODE_NORMAL,
-	CSI2_MODE_REMAP,
-	CSI2_MODE_COMPRESSED,
-	CSI2_MODE_FE_STREAMING
+	CSI2_MODE_NORMAL = 0,
+	CSI2_MODE_REMAP = 1,
+	CSI2_MODE_COMPRESSED = 2,
+	CSI2_MODE_FE_STREAMING = 3,
 };
 
 enum csi2_compression_mode {
@@ -35,6 +37,14 @@ struct csi2_cfg {
 	u16 height;
 	u32 stride;
 	u32 buffer_size;
+};
+
+enum discards_table_index {
+	DISCARDS_TABLE_OVERFLOW = 0,
+	DISCARDS_TABLE_LENGTH_LIMIT,
+	DISCARDS_TABLE_UNMATCHED,
+	DISCARDS_TABLE_INACTIVE,
+	DISCARDS_TABLE_NUM_ENTRIES,
 };
 
 struct csi2_device {
@@ -53,6 +63,12 @@ struct csi2_device {
 
 	struct media_pad pad[CSI2_NUM_CHANNELS * 2];
 	struct v4l2_subdev sd;
+
+	/* lock for csi2 errors counters */
+	spinlock_t errors_lock;
+	u32 overflows;
+	u32 discards_table[DISCARDS_TABLE_NUM_VCS][DISCARDS_TABLE_NUM_ENTRIES];
+	u32 discards_dt_table[DISCARDS_TABLE_NUM_ENTRIES];
 };
 
 void csi2_isr(struct csi2_device *csi2, bool *sof, bool *eof, bool *lci);

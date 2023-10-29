@@ -49,11 +49,13 @@
 #define CFE_MODULE_NAME	"rp1-cfe"
 #define CFE_VERSION	"1.0"
 
-bool cfe_debug_irq;
+bool cfe_debug_verbose;
+module_param_named(verbose_debug, cfe_debug_verbose, bool, 0644);
+MODULE_PARM_DESC(verbose_debug, "verbose debugging messages");
 
-#define cfe_dbg_irq(fmt, arg...)                              \
+#define cfe_dbg_verbose(fmt, arg...)                          \
 	do {                                                  \
-		if (cfe_debug_irq)                            \
+		if (cfe_debug_verbose)                        \
 			dev_dbg(&cfe->pdev->dev, fmt, ##arg); \
 	} while (0)
 #define cfe_dbg(fmt, arg...) dev_dbg(&cfe->pdev->dev, fmt, ##arg)
@@ -108,6 +110,7 @@ const struct v4l2_mbus_framefmt cfe_default_meta_format = {
 	.width = 8192,
 	.height = 1,
 	.code = MEDIA_BUS_FMT_SENSOR_DATA,
+	.field = V4L2_FIELD_NONE,
 };
 
 enum node_ids {
@@ -290,7 +293,6 @@ struct cfe_device {
 	struct csi2_device csi2;
 	struct pisp_fe_device fe;
 
-	bool sensor_embedded_data;
 	int fe_csi2_channel;
 
 	unsigned int sequence;
@@ -518,8 +520,8 @@ static void cfe_schedule_next_csi2_job(struct cfe_device *cfe)
 		node->next_frm = buf;
 		list_del(&buf->list);
 
-		cfe_dbg("%s: [%s] buffer:%p\n",
-			__func__, node_desc[node->id].name, &buf->vb.vb2_buf);
+		cfe_dbg_verbose("%s: [%s] buffer:%p\n", __func__,
+				node_desc[node->id].name, &buf->vb.vb2_buf);
 
 		if (is_meta_node(node)) {
 			size = node->fmt.fmt.meta.buffersize;
@@ -550,8 +552,8 @@ static void cfe_schedule_next_pisp_job(struct cfe_device *cfe)
 		buf = list_first_entry(&node->dma_queue, struct cfe_buffer,
 				       list);
 
-		cfe_dbg_irq("%s: [%s] buffer:%p\n", __func__,
-			    node_desc[node->id].name, &buf->vb.vb2_buf);
+		cfe_dbg_verbose("%s: [%s] buffer:%p\n", __func__,
+				node_desc[node->id].name, &buf->vb.vb2_buf);
 
 		node->next_frm = buf;
 		vb2_bufs[node_desc[i].link_pad] = &buf->vb.vb2_buf;
@@ -573,8 +575,8 @@ static bool cfe_check_job_ready(struct cfe_device *cfe)
 			continue;
 
 		if (list_empty(&node->dma_queue)) {
-			cfe_dbg_irq("%s: [%s] has no buffer, unable to schedule job\n",
-				    __func__, node_desc[i].name);
+			cfe_dbg_verbose("%s: [%s] has no buffer, unable to schedule job\n",
+				__func__, node_desc[i].name);
 			return false;
 		}
 	}
@@ -592,7 +594,7 @@ static void cfe_prepare_next_job(struct cfe_device *cfe)
 	/* Flag if another job is ready after this. */
 	cfe->job_ready = cfe_check_job_ready(cfe);
 
-	cfe_dbg_irq("%s: end with scheduled job\n", __func__);
+	cfe_dbg_verbose("%s: end with scheduled job\n", __func__);
 }
 
 static void cfe_process_buffer_complete(struct cfe_node *node,
@@ -600,8 +602,8 @@ static void cfe_process_buffer_complete(struct cfe_node *node,
 {
 	struct cfe_device *cfe = node->cfe;
 
-	cfe_dbg_irq("%s: [%s] buffer:%p\n", __func__, node_desc[node->id].name,
-		    &node->cur_frm->vb.vb2_buf);
+	cfe_dbg_verbose("%s: [%s] buffer:%p\n", __func__,
+			node_desc[node->id].name, &node->cur_frm->vb.vb2_buf);
 
 	node->cur_frm->vb.sequence = sequence;
 	vb2_buffer_done(&node->cur_frm->vb.vb2_buf, VB2_BUF_STATE_DONE);
@@ -621,8 +623,8 @@ static void cfe_sof_isr_handler(struct cfe_node *node)
 {
 	struct cfe_device *cfe = node->cfe;
 
-	cfe_dbg_irq("%s: [%s] seq %u\n", __func__, node_desc[node->id].name,
-		    cfe->sequence);
+	cfe_dbg_verbose("%s: [%s] seq %u\n", __func__, node_desc[node->id].name,
+			cfe->sequence);
 
 	node->cur_frm = node->next_frm;
 	node->next_frm = NULL;
@@ -651,8 +653,8 @@ static void cfe_eof_isr_handler(struct cfe_node *node)
 {
 	struct cfe_device *cfe = node->cfe;
 
-	cfe_dbg_irq("%s: [%s] seq %u\n", __func__, node_desc[node->id].name,
-		    cfe->sequence);
+	cfe_dbg_verbose("%s: [%s] seq %u\n", __func__, node_desc[node->id].name,
+			cfe->sequence);
 
 	if (node->cur_frm)
 		cfe_process_buffer_complete(node, cfe->sequence);
@@ -763,20 +765,16 @@ static void cfe_start_channel(struct cfe_node *node)
 	struct v4l2_mbus_framefmt *source_fmt;
 	const struct cfe_fmt *fmt;
 	unsigned long flags;
-	unsigned int width = 0, height = 0;
 	bool start_fe = is_fe_enabled(cfe) &&
 			test_all_nodes(cfe, NODE_ENABLED, NODE_STREAMING);
 
 	cfe_dbg("%s: [%s]\n", __func__, node_desc[node->id].name);
 
-	if (start_fe || is_image_output_node(node)) {
-		width = node->fmt.fmt.pix.width;
-		height = node->fmt.fmt.pix.height;
-	}
-
 	state = v4l2_subdev_lock_and_get_active_state(&cfe->csi2.sd);
 
 	if (start_fe) {
+		unsigned int width, height;
+
 		WARN_ON(!is_fe_enabled(cfe));
 		cfe_dbg("%s: %s using csi2 channel %d\n",
 			__func__, node_desc[FE_OUT0].name,
@@ -784,6 +782,12 @@ static void cfe_start_channel(struct cfe_node *node)
 
 		source_fmt = v4l2_subdev_get_pad_format(&cfe->csi2.sd, state, cfe->fe_csi2_channel);
 		fmt = find_format_by_code(source_fmt->code);
+
+		width = source_fmt->width;
+		height = source_fmt->height;
+
+		/* Must have a valid CSI2 datatype. */
+		WARN_ON(!fmt->csi_dt);
 
 		/*
 		 * Start the associated CSI2 Channel as well.
@@ -800,13 +804,21 @@ static void cfe_start_channel(struct cfe_node *node)
 	}
 
 	if (is_csi2_node(node)) {
+		unsigned int width = 0, height = 0;
+
 		u32 mode = CSI2_MODE_NORMAL;
 
 		source_fmt = v4l2_subdev_get_pad_format(&cfe->csi2.sd, state,
 			node_desc[node->id].link_pad - CSI2_NUM_CHANNELS);
 		fmt = find_format_by_code(source_fmt->code);
 
+		/* Must have a valid CSI2 datatype. */
+		WARN_ON(!fmt->csi_dt);
+
 		if (is_image_output_node(node)) {
+			width = source_fmt->width;
+			height = source_fmt->height;
+
 			if (node->fmt.fmt.pix.pixelformat ==
 					fmt->remap[CFE_REMAP_16BIT])
 				mode = CSI2_MODE_REMAP;
@@ -917,8 +929,8 @@ static int cfe_buffer_prepare(struct vb2_buffer *vb)
 	struct cfe_buffer *buf = to_cfe_buffer(vb);
 	unsigned long size;
 
-	cfe_dbg_irq("%s: [%s] buffer:%p\n", __func__, node_desc[node->id].name,
-		    vb);
+	cfe_dbg_verbose("%s: [%s] buffer:%p\n", __func__,
+			node_desc[node->id].name, vb);
 
 	size = is_image_output_node(node) ? node->fmt.fmt.pix.sizeimage :
 					    node->fmt.fmt.meta.buffersize;
@@ -950,8 +962,8 @@ static void cfe_buffer_queue(struct vb2_buffer *vb)
 	struct cfe_buffer *buf = to_cfe_buffer(vb);
 	unsigned long flags;
 
-	cfe_dbg_irq("%s: [%s] buffer:%p\n", __func__, node_desc[node->id].name,
-		    vb);
+	cfe_dbg_verbose("%s: [%s] buffer:%p\n", __func__,
+			node_desc[node->id].name, vb);
 
 	spin_lock_irqsave(&cfe->state_lock, flags);
 
@@ -988,6 +1000,14 @@ static int cfe_start_streaming(struct vb2_queue *vq, unsigned int count)
 	ret = pm_runtime_resume_and_get(&cfe->pdev->dev);
 	if (ret < 0) {
 		cfe_err("pm_runtime_resume_and_get failed\n");
+		goto err_streaming;
+	}
+
+	/* When using the Frontend, we must enable the FE_CONFIG node. */
+	if (is_fe_enabled(cfe) &&
+	    !check_state(cfe, NODE_ENABLED, cfe->node[FE_CONFIG].id)) {
+		cfe_err("FE enabled, but FE_CONFIG node is not\n");
+		ret = -EINVAL;
 		goto err_streaming;
 	}
 
@@ -1490,7 +1510,8 @@ static int cfe_video_link_validate(struct media_link *link)
 
 	if (is_image_output_node(node)) {
 		struct v4l2_pix_format *pix_fmt = &node->fmt.fmt.pix;
-		const struct cfe_fmt *fmt;
+		const struct cfe_fmt *fmt = NULL;
+		unsigned int i;
 
 		if (source_fmt->width != pix_fmt->width ||
 		    source_fmt->height != pix_fmt->height) {
@@ -1502,8 +1523,14 @@ static int cfe_video_link_validate(struct media_link *link)
 			goto out;
 		}
 
-		fmt = find_format_by_code(source_fmt->code);
-		if (!fmt || fmt->fourcc != pix_fmt->pixelformat) {
+		for (i = 0; i < ARRAY_SIZE(formats); i++) {
+			if (formats[i].code == source_fmt->code &&
+			    formats[i].fourcc == pix_fmt->pixelformat) {
+				fmt = &formats[i];
+				break;
+			}
+		}
+		if (!fmt) {
 			cfe_err("Format mismatch!\n");
 			ret = -EINVAL;
 			goto out;
@@ -1815,8 +1842,6 @@ static int cfe_probe_complete(struct cfe_device *cfe)
 
 	cfe->v4l2_dev.notify = cfe_notify;
 
-	cfe->sensor_embedded_data = (cfe->sensor->entity.num_pads >= 2);
-
 	for (i = 0; i < NUM_NODES; i++) {
 		ret = cfe_register_node(cfe, i);
 		if (ret) {
@@ -1837,17 +1862,10 @@ static int cfe_probe_complete(struct cfe_device *cfe)
 		goto unregister;
 	}
 
-	/*
-	 * Release the initial reference, all references are now owned by the
-	 * video devices.
-	 */
-	cfe_put(cfe);
 	return 0;
 
 unregister:
 	cfe_unregister_nodes(cfe);
-	cfe_put(cfe);
-
 	return ret;
 }
 
@@ -2128,6 +2146,8 @@ static int cfe_remove(struct platform_device *pdev)
 	pm_runtime_disable(&pdev->dev);
 
 	v4l2_device_unregister(&cfe->v4l2_dev);
+
+	cfe_put(cfe);
 
 	return 0;
 }

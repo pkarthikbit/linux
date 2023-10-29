@@ -114,9 +114,9 @@ static const struct pisp_fe_config_param pisp_fe_config_map[] = {
 					sizeof(struct pisp_fe_output_config)         },
 };
 
-#define pisp_fe_dbg_irq(fmt, arg...)                            \
+#define pisp_fe_dbg_verbose(fmt, arg...)                        \
 	do {                                                    \
-		if (cfe_debug_irq)                              \
+		if (cfe_debug_verbose)                          \
 			dev_dbg(fe->v4l2_dev->dev, fmt, ##arg); \
 	} while (0)
 #define pisp_fe_dbg(fmt, arg...) dev_dbg(fe->v4l2_dev->dev, fmt, ##arg)
@@ -132,12 +132,14 @@ static inline void pisp_fe_reg_write(struct pisp_fe_device *fe, u32 offset,
 				     u32 val)
 {
 	writel(val, fe->base + offset);
+	pisp_fe_dbg_verbose("fe: write 0x%04x -> 0x%03x\n", val, offset);
 }
 
 static inline void pisp_fe_reg_write_relaxed(struct pisp_fe_device *fe, u32 offset,
 					     u32 val)
 {
 	writel_relaxed(val, fe->base + offset);
+	pisp_fe_dbg_verbose("fe: write 0x%04x -> 0x%03x\n", val, offset);
 }
 
 static int pisp_regs_show(struct seq_file *s, void *data)
@@ -202,9 +204,9 @@ void pisp_fe_isr(struct pisp_fe_device *fe, bool *sof, bool *eof)
 	int_status = pisp_fe_reg_read(fe, FE_INT_STATUS);
 	pisp_fe_reg_write(fe, FE_INT_STATUS, int_status);
 
-	pisp_fe_dbg_irq("%s: status 0x%x out 0x%x frame 0x%x error 0x%x int 0x%x\n",
-			__func__, status, out_status, frame_status, error_status,
-			int_status);
+	pisp_fe_dbg_verbose("%s: status 0x%x out 0x%x frame 0x%x error 0x%x int 0x%x\n",
+		__func__, status, out_status, frame_status, error_status,
+		int_status);
 
 	/* We do not report interrupts for the input/stream pad. */
 	for (i = 0; i < FE_NUM_PADS - 1; i++) {
@@ -339,7 +341,7 @@ void pisp_fe_submit_job(struct pisp_fe_device *fe, struct vb2_buffer **vb2_bufs,
 	 * sequence of relaxed writes which follow.
 	 */
 	status = pisp_fe_reg_read(fe, FE_STATUS);
-	pisp_fe_dbg_irq("%s: status = 0x%x\n", __func__, status);
+	pisp_fe_dbg_verbose("%s: status = 0x%x\n", __func__, status);
 	if (WARN_ON(status & FE_STATUS_QUEUED))
 		return;
 
@@ -372,7 +374,7 @@ void pisp_fe_submit_job(struct pisp_fe_device *fe, struct vb2_buffer **vb2_bufs,
 void pisp_fe_start(struct pisp_fe_device *fe)
 {
 	pisp_fe_reg_write(fe, FE_CONTROL, FE_CONTROL_RESET);
-	pisp_fe_reg_write(fe, FE_INT_STATUS, -1);
+	pisp_fe_reg_write(fe, FE_INT_STATUS, ~0);
 	pisp_fe_reg_write(fe, FE_INT_EN, FE_INT_EOF | FE_INT_SOF | FE_INT_LINES0 | FE_INT_LINES1);
 	fe->inframe_count = 0;
 }
@@ -383,7 +385,7 @@ void pisp_fe_stop(struct pisp_fe_device *fe)
 	pisp_fe_reg_write(fe, FE_CONTROL, FE_CONTROL_ABORT);
 	usleep_range(1000, 2000);
 	WARN_ON(pisp_fe_reg_read(fe, FE_STATUS));
-	pisp_fe_reg_write(fe, FE_INT_STATUS, -1);
+	pisp_fe_reg_write(fe, FE_INT_STATUS, ~0);
 }
 
 static struct pisp_fe_device *to_pisp_fe_device(struct v4l2_subdev *subdev)
@@ -402,7 +404,7 @@ static int pisp_fe_init_cfg(struct v4l2_subdev *sd,
 
 	fmt = v4l2_subdev_get_pad_format(sd, state, FE_CONFIG_PAD);
 	*fmt = cfe_default_meta_format;
-	fmt->code = MEDIA_BUS_FMT_PISP_FE_CONFIG;
+	fmt->code = MEDIA_BUS_FMT_FIXED;
 
 	fmt = v4l2_subdev_get_pad_format(sd, state, FE_OUTPUT0_PAD);
 	*fmt = cfe_default_format;
@@ -414,7 +416,7 @@ static int pisp_fe_init_cfg(struct v4l2_subdev *sd,
 
 	fmt = v4l2_subdev_get_pad_format(sd, state, FE_STATS_PAD);
 	*fmt = cfe_default_meta_format;
-	fmt->code = MEDIA_BUS_FMT_PISP_FE_STATS;
+	fmt->code = MEDIA_BUS_FMT_FIXED;
 
 	return 0;
 }
@@ -435,18 +437,15 @@ static int pisp_fe_pad_set_fmt(struct v4l2_subdev *sd,
 	case FE_OUTPUT1_PAD:
 		cfe_fmt = find_format_by_code(format->format.code);
 		if (!cfe_fmt || !(cfe_fmt->flags & CFE_FORMAT_FLAG_FE_OUT))
-			cfe_fmt = find_format_by_code(MEDIA_BUS_FMT_SBGGR10_1X10);
+			cfe_fmt = find_format_by_code(MEDIA_BUS_FMT_SRGGB16_1X16);
 
 		format->format.code = cfe_fmt->code;
 
 		break;
 
-	case FE_CONFIG_PAD:
-		format->format.code = MEDIA_BUS_FMT_PISP_FE_CONFIG;
-		break;
-
 	case FE_STATS_PAD:
-		format->format.code = MEDIA_BUS_FMT_PISP_FE_STATS;
+	case FE_CONFIG_PAD:
+		format->format.code = MEDIA_BUS_FMT_FIXED;
 		break;
 	}
 

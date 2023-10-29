@@ -16,9 +16,13 @@
 #include "csi2.h"
 #include "cfe.h"
 
-#define csi2_dbg_irq(fmt, arg...)                                 \
+static bool csi2_track_errors;
+module_param_named(track_csi2_errors, csi2_track_errors, bool, 0);
+MODULE_PARM_DESC(track_csi2_errors, "track csi-2 errors");
+
+#define csi2_dbg_verbose(fmt, arg...)                             \
 	do {                                                      \
-		if (cfe_debug_irq)                                \
+		if (cfe_debug_verbose)                            \
 			dev_dbg(csi2->v4l2_dev->dev, fmt, ##arg); \
 	} while (0)
 #define csi2_dbg(fmt, arg...) dev_dbg(csi2->v4l2_dev->dev, fmt, ##arg)
@@ -32,9 +36,28 @@
 #define CSI2_DISCARDS_INACTIVE	0x00c
 #define CSI2_DISCARDS_UNMATCHED	0x010
 #define CSI2_DISCARDS_LEN_LIMIT	0x014
+
+#define CSI2_DISCARDS_AMOUNT_SHIFT	0
+#define CSI2_DISCARDS_AMOUNT_MASK	GENMASK(23, 0)
+#define CSI2_DISCARDS_DT_SHIFT		24
+#define CSI2_DISCARDS_DT_MASK		GENMASK(29, 24)
+#define CSI2_DISCARDS_VC_SHIFT		30
+#define CSI2_DISCARDS_VC_MASK		GENMASK(31, 30)
+
 #define CSI2_LLEV_PANICS	0x018
 #define CSI2_ULEV_PANICS	0x01c
 #define CSI2_IRQ_MASK		0x020
+#define CSI2_IRQ_MASK_IRQ_OVERFLOW		BIT(0)
+#define CSI2_IRQ_MASK_IRQ_DISCARD_OVERFLOW	BIT(1)
+#define CSI2_IRQ_MASK_IRQ_DISCARD_LENGTH_LIMIT	BIT(2)
+#define CSI2_IRQ_MASK_IRQ_DISCARD_UNMATCHED	BIT(3)
+#define CSI2_IRQ_MASK_IRQ_DISCARD_INACTIVE	BIT(4)
+#define CSI2_IRQ_MASK_IRQ_ALL                                              \
+	(CSI2_IRQ_MASK_IRQ_OVERFLOW | CSI2_IRQ_MASK_IRQ_DISCARD_OVERFLOW | \
+	 CSI2_IRQ_MASK_IRQ_DISCARD_LENGTH_LIMIT |                          \
+	 CSI2_IRQ_MASK_IRQ_DISCARD_UNMATCHED |                             \
+	 CSI2_IRQ_MASK_IRQ_DISCARD_INACTIVE)
+
 #define CSI2_CTRL		0x024
 #define CSI2_CH_CTRL(x)		((x) * 0x40 + 0x28)
 #define CSI2_CH_ADDR0(x)	((x) * 0x40 + 0x2c)
@@ -92,6 +115,7 @@ static inline u32 csi2_reg_read(struct csi2_device *csi2, u32 offset)
 static inline void csi2_reg_write(struct csi2_device *csi2, u32 offset, u32 val)
 {
 	writel(val, csi2->base + offset);
+	csi2_dbg_verbose("csi2: write 0x%04x -> 0x%03x\n", val, offset);
 }
 
 static inline void set_field(u32 *valp, u32 field, u32 mask)
@@ -148,13 +172,99 @@ static int csi2_regs_show(struct seq_file *s, void *data)
 
 DEFINE_SHOW_ATTRIBUTE(csi2_regs);
 
+static int csi2_errors_show(struct seq_file *s, void *data)
+{
+	struct csi2_device *csi2 = s->private;
+	unsigned long flags;
+	u32 discards_table[DISCARDS_TABLE_NUM_VCS][DISCARDS_TABLE_NUM_ENTRIES];
+	u32 discards_dt_table[DISCARDS_TABLE_NUM_ENTRIES];
+	u32 overflows;
+
+	spin_lock_irqsave(&csi2->errors_lock, flags);
+
+	memcpy(discards_table, csi2->discards_table, sizeof(discards_table));
+	memcpy(discards_dt_table, csi2->discards_dt_table,
+	       sizeof(discards_dt_table));
+	overflows = csi2->overflows;
+
+	csi2->overflows = 0;
+	memset(csi2->discards_table, 0, sizeof(discards_table));
+	memset(csi2->discards_dt_table, 0, sizeof(discards_dt_table));
+
+	spin_unlock_irqrestore(&csi2->errors_lock, flags);
+
+	seq_printf(s, "Overflows %u\n", overflows);
+	seq_puts(s, "Discards:\n");
+	seq_puts(s, "VC            OVLF        LEN  UNMATCHED   INACTIVE\n");
+
+	for (unsigned int vc = 0; vc < DISCARDS_TABLE_NUM_VCS; ++vc) {
+		seq_printf(s, "%u       %10u %10u %10u %10u\n", vc,
+			   discards_table[vc][DISCARDS_TABLE_OVERFLOW],
+			   discards_table[vc][DISCARDS_TABLE_LENGTH_LIMIT],
+			   discards_table[vc][DISCARDS_TABLE_UNMATCHED],
+			   discards_table[vc][DISCARDS_TABLE_INACTIVE]);
+	}
+
+	seq_printf(s, "Last DT %10u %10u %10u %10u\n",
+		   discards_dt_table[DISCARDS_TABLE_OVERFLOW],
+		   discards_dt_table[DISCARDS_TABLE_LENGTH_LIMIT],
+		   discards_dt_table[DISCARDS_TABLE_UNMATCHED],
+		   discards_dt_table[DISCARDS_TABLE_INACTIVE]);
+
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(csi2_errors);
+
+static void csi2_isr_handle_errors(struct csi2_device *csi2, u32 status)
+{
+	spin_lock(&csi2->errors_lock);
+
+	if (status & IRQ_OVERFLOW)
+		csi2->overflows++;
+
+	for (unsigned int i = 0; i < DISCARDS_TABLE_NUM_ENTRIES; ++i) {
+		static const u32 discard_bits[] = {
+			IRQ_DISCARD_OVERFLOW,
+			IRQ_DISCARD_LEN_LIMIT,
+			IRQ_DISCARD_UNMATCHED,
+			IRQ_DISCARD_INACTIVE,
+		};
+		static const u8 discard_regs[] = {
+			CSI2_DISCARDS_OVERFLOW,
+			CSI2_DISCARDS_LEN_LIMIT,
+			CSI2_DISCARDS_UNMATCHED,
+			CSI2_DISCARDS_INACTIVE,
+		};
+		u32 amount;
+		u8 dt, vc;
+		u32 v;
+
+		if (!(status & discard_bits[i]))
+			continue;
+
+		v = csi2_reg_read(csi2, discard_regs[i]);
+		csi2_reg_write(csi2, discard_regs[i], 0);
+
+		amount = (v & CSI2_DISCARDS_AMOUNT_MASK) >>
+			 CSI2_DISCARDS_AMOUNT_SHIFT;
+		dt = (v & CSI2_DISCARDS_DT_MASK) >> CSI2_DISCARDS_DT_SHIFT;
+		vc = (v & CSI2_DISCARDS_VC_MASK) >> CSI2_DISCARDS_VC_SHIFT;
+
+		csi2->discards_table[vc][i] += amount;
+		csi2->discards_dt_table[i] = dt;
+	}
+
+	spin_unlock(&csi2->errors_lock);
+}
+
 void csi2_isr(struct csi2_device *csi2, bool *sof, bool *eof, bool *lci)
 {
 	unsigned int i;
 	u32 status;
 
 	status = csi2_reg_read(csi2, CSI2_STATUS);
-	csi2_dbg_irq("ISR: STA: 0x%x\n", status);
+	csi2_dbg_verbose("ISR: STA: 0x%x\n", status);
 
 	/* Write value back to clear the interrupts */
 	csi2_reg_write(csi2, CSI2_STATUS, status);
@@ -167,21 +277,24 @@ void csi2_isr(struct csi2_device *csi2, bool *sof, bool *eof, bool *lci)
 
 		dbg = csi2_reg_read(csi2, CSI2_CH_DEBUG(i));
 
-		csi2_dbg_irq("ISR: [%u], %s%s%s%s%s frame: %u line: %u\n", i,
-			     (status & IRQ_FS(i)) ? "FS " : "",
-			     (status & IRQ_FE(i)) ? "FE " : "",
-			     (status & IRQ_FE_ACK(i)) ? "FE_ACK " : "",
-			     (status & IRQ_LE(i)) ? "LE " : "",
-			     (status & IRQ_LE_ACK(i)) ? "LE_ACK " : "",
-			     dbg >> 16,
-			     csi2->num_lines[i] ?
-				     ((dbg & 0xffff) % csi2->num_lines[i]) :
-				     0);
+		csi2_dbg_verbose("ISR: [%u], %s%s%s%s%s frame: %u line: %u\n",
+				 i, (status & IRQ_FS(i)) ? "FS " : "",
+				 (status & IRQ_FE(i)) ? "FE " : "",
+				 (status & IRQ_FE_ACK(i)) ? "FE_ACK " : "",
+				 (status & IRQ_LE(i)) ? "LE " : "",
+				 (status & IRQ_LE_ACK(i)) ? "LE_ACK " : "",
+				 dbg >> 16,
+				 csi2->num_lines[i] ?
+					 ((dbg & 0xffff) % csi2->num_lines[i]) :
+					 0);
 
 		sof[i] = !!(status & IRQ_FS(i));
 		eof[i] = !!(status & IRQ_FE_ACK(i));
 		lci[i] = !!(status & IRQ_LE_ACK(i));
 	}
+
+	if (csi2_track_errors)
+		csi2_isr_handle_errors(csi2, status);
 }
 
 void csi2_set_buffer(struct csi2_device *csi2, unsigned int channel,
@@ -253,6 +366,7 @@ void csi2_start_channel(struct csi2_device *csi2, unsigned int channel,
 		 */
 		set_field(&ctrl, 0x3ff, LC_MASK);
 		set_field(&ctrl, 0x00, CH_MODE_MASK);
+		csi2_reg_write(csi2, CSI2_CH_FRAME_SIZE(channel), 0);
 	}
 
 	set_field(&ctrl, dt, DT_MASK);
@@ -275,15 +389,20 @@ void csi2_stop_channel(struct csi2_device *csi2, unsigned int channel)
 
 void csi2_open_rx(struct csi2_device *csi2)
 {
+	csi2_reg_write(csi2, CSI2_IRQ_MASK,
+		       csi2_track_errors ? CSI2_IRQ_MASK_IRQ_ALL : 0);
+
 	dphy_start(&csi2->dphy);
 
-	if (!csi2->multipacket_line)
-		csi2_reg_write(csi2, CSI2_CTRL, EOP_IS_EOL);
+	csi2_reg_write(csi2, CSI2_CTRL,
+		       csi2->multipacket_line ? 0 : EOP_IS_EOL);
 }
 
 void csi2_close_rx(struct csi2_device *csi2)
 {
 	dphy_stop(&csi2->dphy);
+
+	csi2_reg_write(csi2, CSI2_IRQ_MASK, 0);
 }
 
 static struct csi2_device *to_csi2_device(struct v4l2_subdev *subdev)
@@ -396,10 +515,16 @@ int csi2_init(struct csi2_device *csi2, struct dentry *debugfs)
 {
 	unsigned int i, ret;
 
+	spin_lock_init(&csi2->errors_lock);
+
 	csi2->dphy.dev = csi2->v4l2_dev->dev;
 	dphy_probe(&csi2->dphy);
 
 	debugfs_create_file("csi2_regs", 0444, debugfs, csi2, &csi2_regs_fops);
+
+	if (csi2_track_errors)
+		debugfs_create_file("csi2_errors", 0444, debugfs, csi2,
+				    &csi2_errors_fops);
 
 	for (i = 0; i < CSI2_NUM_CHANNELS * 2; i++)
 		csi2->pad[i].flags = i < CSI2_NUM_CHANNELS ?
